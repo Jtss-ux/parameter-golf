@@ -44,7 +44,7 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 12))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -81,19 +81,21 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "1")))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 12))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 10))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
-    ve_layers = os.environ.get("VE_LAYERS", "9,10")
+    ve_layers = os.environ.get("VE_LAYERS", "7,8,9")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
-    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
+    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))  # VRL with sigmoid gates enabled for deep recursion
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    recursion_depth = int(os.environ.get("RECURSION_DEPTH", 3))
+    use_checkpointing = bool(int(os.environ.get("USE_CHECKPOINTING", "1")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -806,6 +808,8 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        recursion_depth: int = 1,
+        use_checkpointing: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -815,6 +819,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.value_residual = value_residual
+        self.recursion_depth = recursion_depth
+        self.use_checkpointing = use_checkpointing
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -923,25 +929,35 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        for _ in range(2): # Recursive Pass (Depth 12 -> 24)
+        
+        def run_recursion_step(x_in, v0_in):
+            x_curr, v0_curr = x_in, v0_in
+            local_skips = []
             for i in range(self.num_encoder_layers):
                 ve = self._get_ve(i, input_ids, ve_cache)
-                x, raw_v = self.blocks[i](x, x0,
+                x_curr, raw_v = self.blocks[i](x_curr, x0,
                     self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                     self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                    v_embed=ve, v0=v0)
-                if v0 is None and raw_v is not None:
-                    v0 = raw_v
-                skips.append(x)
+                    v_embed=ve, v0=v0_curr)
+                if v0_curr is None and raw_v is not None:
+                    v0_curr = raw_v
+                local_skips.append(x_curr)
             for i in range(self.num_decoder_layers):
                 bi = self.num_encoder_layers + i
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                if local_skips:
+                    x_curr = x_curr + self.skip_weights[i].to(dtype=x_curr.dtype)[None, None, :] * local_skips.pop()
                 ve = self._get_ve(bi, input_ids, ve_cache)
-                x, _ = self.blocks[bi](x, x0,
+                x_curr, _ = self.blocks[bi](x_curr, x0,
                     self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                     self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                    v_embed=ve, v0=v0)
+                    v_embed=ve, v0=v0_curr)
+            return x_curr, v0_curr
+
+        for _ in range(self.recursion_depth):
+            if self.training and self.use_checkpointing:
+                x, v0 = torch.utils.checkpoint.checkpoint(run_recursion_step, x, v0, use_reentrant=False)
+            else:
+                x, v0 = run_recursion_step(x, v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -980,27 +996,33 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         v0 = None
-        skips: list[Tensor] = []
         ve_cache: dict = {}
-        for _ in range(2): # Recursive Pass (Depth 12 -> 24)
+        
+        def run_recursion_step(x_in, v0_in):
+            x_curr, v0_curr = x_in, v0_in
+            local_skips = []
             for i in range(self.num_encoder_layers):
                 ve = self._get_ve(i, input_ids, ve_cache)
-                x, raw_v = self.blocks[i](x, x0,
+                x_curr, raw_v = self.blocks[i](x_curr, x0,
                     self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                     self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                    v_embed=ve, v0=v0)
-                if v0 is None and raw_v is not None:
-                    v0 = raw_v
-                skips.append(x)
+                    v_embed=ve, v0=v0_curr)
+                if v0_curr is None and raw_v is not None:
+                    v0_curr = raw_v
+                local_skips.append(x_curr)
             for i in range(self.num_decoder_layers):
                 bi = self.num_encoder_layers + i
-                if skips:
-                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                if local_skips:
+                    x_curr = x_curr + self.skip_weights[i].to(dtype=x_curr.dtype)[None, None, :] * local_skips.pop()
                 ve = self._get_ve(bi, input_ids, ve_cache)
-                x, _ = self.blocks[bi](x, x0,
+                x_curr, _ = self.blocks[bi](x_curr, x0,
                     self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                     self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                    v_embed=ve, v0=v0)
+                    v_embed=ve, v0=v0_curr)
+            return x_curr, v0_curr
+
+        for _ in range(self.recursion_depth):
+            x, v0 = run_recursion_step(x, v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1650,6 +1672,8 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        recursion_depth=args.recursion_depth,
+        use_checkpointing=args.use_checkpointing,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
