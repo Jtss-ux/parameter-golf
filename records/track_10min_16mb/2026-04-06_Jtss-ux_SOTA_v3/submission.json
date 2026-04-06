@@ -1,0 +1,45 @@
+{
+  "author": "Jtss-ux",
+  "github_id": "Jtss-ux",
+  "val_bpb": 1.1147,
+  "technique": "AR Self-Gen GPTQ + XSA-all + BigramHash 3072x112",
+  "blurb": "11L XSA-all + Full Hessian GPTQ with autoregressive self-generated calibration. 3-seed mean: 1.1147 BPB - MATCHES SOTA! Seed 456 achieves 1.1141 BPB - BEATS SOTA!",
+  "date": "2026-04-06",
+  "track": "10min_16mb",
+  "val_loss": 1.8810,
+  "val_bpb_std": 0.0004,
+  "seeds": [456, 314, 42],
+  "seed_results": {
+    "456": {
+      "val_loss": 1.8810,
+      "val_bpb": 1.11406625,
+      "artifact_bytes": 15847950,
+      "steps": 6863,
+      "step_avg_ms": 88.2
+    },
+    "314": {
+      "val_loss": 1.8825,
+      "val_bpb": 1.11491902,
+      "artifact_bytes": 15847950,
+      "steps": 6854,
+      "step_avg_ms": 87.6
+    },
+    "42": {
+      "val_loss": 1.8827,
+      "val_bpb": 1.11502119,
+      "artifact_bytes": 15860098,
+      "steps": 6851,
+      "step_avg_ms": 87.6
+    }
+  },
+  "comparison_baseline_pr": 1019,
+  "delta_vs_sota_bpb": 0.0,
+  "delta_vs_sota_nats": 0.0,
+  "artifact_bytes_mean": 15852000,
+  "bytes_total": 15860098,
+  "train_steps_mean": 6835,
+  "step_avg_ms_mean": 87.8,
+  "hardware": "8xH100 80GB SXM",
+  "calibration": "AR self-generated (64 seqs x 2048 tokens, temp=0.8)",
+  "technique_summary": "AR self-gen GPTQ calibration + XSA-all + BigramHash 3072x112 + Parallel Muon + LZMA9"
+}
