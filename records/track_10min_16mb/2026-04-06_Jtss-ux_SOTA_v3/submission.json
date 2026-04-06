@@ -14,7 +14,7 @@
       "val_loss": 1.8810,
       "val_bpb": 1.11406625,
       "artifact_bytes": 15847950,
-      "steps": 6800,
+      "steps": 6863,
       "step_avg_ms": 88.2
     },
     "314": {
